@@ -1,0 +1,42 @@
+---
+title: "LCZ_simplification"
+author: "Eva Beele"
+date: "2026-06-19"
+output: html_document
+---
+
+```{r}
+library(terra)
+
+# LCZ raster inladen
+lcz <- rast("C:/Users/u0138370/OneDrive - KU Leuven/EES-FNL-BRANCH - 1. Data/Sampling_design/LCZ/LCZ_StudyArea.tif")
+plot(lcz)
+
+# Bekijk de aanwezige waarden
+freq(lcz)
+
+# Reclassificeren
+lcz_3class <- subst(
+  lcz,
+  from = 1:17,
+  to = c(rep(1,3), rep(2,7), rep(3,7))
+)
+
+# Labels toevoegen
+levels(lcz_3class) <- data.frame(
+  value = c(1,2,3),
+  class = c("Compact urban",
+            "Open urban",
+            "Natural")
+)
+
+# Opslaan
+writeRaster(lcz_3class,
+            "C:/Users/u0138370/OneDrive - KU Leuven/EES-FNL-BRANCH - 1. Data/Sampling_design/R/Output/LCZ_3classes.tif",
+            overwrite = TRUE)
+
+plot(lcz_3class)
+freq(lcz_3class)
+unique(values(lcz_3class))
+```
+

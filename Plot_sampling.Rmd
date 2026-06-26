@@ -1,0 +1,762 @@
+---
+title: "Plot_sampling"
+author: "Wouter Strauven"
+date: "2026-06-25"
+output: html_document
+---
+
+0. Setup
+```{r setup}
+# Libraries
+library(terra)
+library(dplyr)
+library(tidyr)
+library(rlang)
+library(stringr)
+
+```
+
+1. Read in layers
+```{r}
+# Study area
+Study_area <- vect("F:/KULeuven/BRANCH/Materials_and_methods/Sampling_design/Study_Area/BRANCH_StudyArea_31370.gpkg")
+
+# Read in stratification layers
+LCZ <- rast("Output/LCZ_3classes.tif")
+OSM <- rast("Output/OSM_raster_10m.tif")
+
+# Inspect
+Study_area
+LCZ
+OSM
+crs(Study_area)
+crs(LCZ)
+crs(OSM)
+
+# Fix crs
+crs(OSM) <- "EPSG:31370"
+OSM <- project(OSM, LCZ)
+
+# Provide unique names for columns
+names(LCZ) <- "LCZ_class"
+names(OSM) <- "OSM_class"
+
+```
+
+2. Stratified sampling
+2.1. Define functions
+```{r}
+# Create a square polygon (SpatVector) centered on a point (x,y) with side 'size' (meters)
+make_square <- function(x, y, size, crs) {
+  half <- size / 2
+  coords <- matrix(
+    c(x - half, y - half,
+      x + half, y - half,
+      x + half, y + half,
+      x - half, y + half,
+      x - half, y - half),
+    ncol = 2, byrow = TRUE
+  )
+  p <- vect(list(coords), type = "polygons", crs = crs)
+  p
+}
+
+# Sample candidate points inside a polygon but at least 'half_size' away from boundary
+sample_candidates_interior <- function(poly, n_candidates = 1000, half_size = 50, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  # Erode polygon by half_size to ensure square fits inside
+  inner <- try(buffer(poly, width = -half_size), silent = TRUE)
+  if (inherits(inner, "try-error") || nrow(inner) == 0) {
+    # If erosion removes polygon (too small), fall back to original polygon but warn
+    inner <- poly
+  }
+  # Use spatSample to draw random points inside inner polygon
+  pts <- spatSample(inner, size = n_candidates, method = "random", as.points = TRUE)
+  # If spatSample returns fewer than requested, return what we have
+  pts
+}
+
+# Minimal precondition check (put at start of function)
+if (!identical(terra::crs(Study_area), terra::crs(LCZ))) {
+  stop("CRS mismatch: Study_area and LCZ must share the same CRS before calling this function.")
+}
+if (!identical(terra::crs(LCZ), terra::crs(OSM))) {
+  stop("CRS mismatch: LCZ and OSM must share the same CRS before calling this function.")
+}
+
+# Compute percent cover of raster classes inside a polygon
+percent_cover_in_polygon <- function(rast, poly) {
+  # crop and mask
+  r_crop <- crop(rast, poly, snap = "out")
+  r_mask <- mask(r_crop, poly)
+  vals <- values(r_mask)
+  vals <- vals[!is.na(vals)]
+  if (length(vals) == 0) return(tibble(class = NA_integer_, count = 0L, pct = 0))
+  tab <- as.data.frame(table(vals), stringsAsFactors = FALSE)
+  names(tab) <- c("class", "count")
+  tab <- tab %>% mutate(class = as.integer(as.character(class)))
+  tab <- tab %>% mutate(pct = 100 * count / sum(count))
+  tab
+}
+
+# Main function: sample plots per city
+sample_plots_per_city <- function(
+  Study_area,        # SpatVector with city polygons (one feature per city)
+  LCZ,               # raster with LCZ_class
+  OSM,               # raster with OSM_class
+  city_id_field = "fid",   # field in Study_area identifying cities (adjust if different)
+  cities = NULL,     # vector of city IDs to process (if NULL -> all)
+  n_plots_city = 20,
+  plot_size = 100,   # meters (square side)
+  seed = 1234,
+  use_strata = TRUE,
+  strata_vars = c("LCZ_class", "OSM_class"), # which raster attributes to use for stratification
+  strata_mode = c("proportional", "equal"),
+  n_candidates = 2000,   # number of candidate points to draw per city (must be >= n_plots_city)
+  allowed_osm = NULL,    # optional vector of OSM_class values to include (e.g., c(1,2,3,4))
+  export_gpkg = FALSE,
+  export_folder = "exports",
+  export_name_prefix = "plots"
+) {
+  strata_mode <- match.arg(strata_mode)
+  set.seed(seed)
+  # checks
+  if (!inherits(Study_area, "SpatVector")) stop("Study_area must be a SpatVector")
+  if (!inherits(LCZ, "SpatRaster") || !inherits(OSM, "SpatRaster")) stop("LCZ and OSM must be SpatRaster")
+  if (!is.null(cities)) {
+    Study_area <- Study_area[Study_area[[city_id_field]] %in% cities, ]
+  }
+
+  # prepare outputs
+  all_points <- vect(crs = crs(Study_area)) # empty
+  all_squares <- vect(crs = crs(Study_area))
+  plot_stats <- list()
+  # iterate cities
+  for (i in seq_len(nrow(Study_area))) {
+    city_poly <- Study_area[i, ]
+    city_id <- city_poly[[city_id_field]]
+    message("Sampling city: ", city_id)
+    # sample candidate points inside eroded polygon
+    half_size <- plot_size / 2
+    candidates <- sample_candidates_interior(city_poly, n_candidates = n_candidates, half_size = half_size, seed = seed + i)
+    if (is.null(candidates) || nrow(candidates) == 0) {
+      warning("No candidate points for city ", city_id, " (polygon too small after erosion). Skipping.")
+      next
+    }
+    # extract LCZ and OSM at candidate points
+    cand_df <- as.data.frame(candidates, geom = "XY")
+    cand_df$ID_pt <- seq_len(nrow(cand_df))
+    # extract raster values
+    cand_df$LCZ_class <- terra::extract(LCZ, candidates)[, "LCZ_class"]
+    cand_df$OSM_class <- terra::extract(OSM, candidates)[, "OSM_class"]
+    # optionally filter allowed OSM classes (e.g., exclude 'Overige')
+    if (!is.null(allowed_osm)) {
+      cand_df <- cand_df %>% filter(OSM_class %in% allowed_osm)
+    }
+    # remove NA strata candidates
+    cand_df <- cand_df %>% filter(!is.na(LCZ_class) | !is.na(OSM_class))
+    if (nrow(cand_df) == 0) {
+      warning("No valid candidate points with strata values for city ", city_id)
+      next
+    }
+    # Decide sampling strategy: stratify by each strata_var separately (user requested separate stratification)
+    # We'll perform sequential stratified sampling: first ensure LCZ distribution (if present), then OSM on remaining slots.
+    n_needed <- n_plots_city
+    selected_ids <- integer(0)
+    # Helper to sample by one strata variable
+    sample_by_stratum <- function(df, var, n_slots, mode) {
+      if (n_slots <= 0) return(integer(0))
+      df <- df %>% filter(!is.na(.data[[var]]))
+      if (nrow(df) == 0) return(integer(0))
+      if (mode == "proportional") {
+        counts <- df %>% count(!!sym(var), name = "n_stratum")
+        counts <- counts %>% mutate(alloc = pmax(1, round(n_stratum / sum(n_stratum) * n_slots)))
+      } else { # equal
+        n_strata <- n_distinct(df[[var]])
+        per_stratum <- ceiling(n_slots / n_strata)
+        counts <- df %>% distinct(!!sym(var)) %>% mutate(alloc = per_stratum)
+        names(counts)[1] <- var
+      }
+      df <- df %>% left_join(counts %>% select(!!sym(var), alloc), by = var)
+      picks <- df %>% group_by(!!sym(var)) %>%
+        group_modify(~ {
+          n_alloc <- unique(.x$alloc)
+          n_alloc <- ifelse(length(n_alloc) == 0, 0, n_alloc[1])
+          if (n_alloc <= 0) return(.x[0, ])
+          n_draw <- min(n_alloc, nrow(.x))
+          .x %>% slice_sample(n = n_draw)
+        }) %>% ungroup()
+      picks$ID_pt
+    }
+    # 1) stratify by LCZ_class if requested
+    if (use_strata && "LCZ_class" %in% strata_vars) {
+      ids_lcz <- sample_by_stratum(cand_df %>% filter(!(ID_pt %in% selected_ids)), "LCZ_class", n_needed, strata_mode)
+      selected_ids <- c(selected_ids, ids_lcz)
+      n_needed <- n_plots_city - length(selected_ids)
+    }
+    # 2) stratify by OSM_class if requested (fill remaining)
+    if (n_needed > 0 && use_strata && "OSM_class" %in% strata_vars) {
+      ids_osm <- sample_by_stratum(cand_df %>% filter(!(ID_pt %in% selected_ids)), "OSM_class", n_needed, strata_mode)
+      selected_ids <- c(selected_ids, ids_osm)
+      n_needed <- n_plots_city - length(selected_ids)
+    }
+    # 3) if still short, fill randomly from remaining candidates
+    if (n_needed > 0) {
+      remaining <- cand_df %>% filter(!(ID_pt %in% selected_ids))
+      if (nrow(remaining) > 0) {
+        extra <- remaining %>% slice_sample(n = min(n_needed, nrow(remaining)))
+        selected_ids <- c(selected_ids, extra$ID_pt)
+      }
+    }
+    # Build selected points and squares
+    sel_df <- cand_df %>% filter(ID_pt %in% selected_ids)
+    if (nrow(sel_df) == 0) {
+      warning("No selected points for city ", city_id)
+      next
+    }
+    pts_sel <- vect(sel_df, geom = c("x", "y"), crs = crs(Study_area))
+    # create squares
+    squares_list <- lapply(seq_len(nrow(sel_df)), function(j) {
+      make_square(sel_df$x[j], sel_df$y[j], plot_size, crs = crs(Study_area))
+    })
+    squares <- do.call(rbind, squares_list)
+    # attach attributes
+    pts_sel$city_id <- rep(city_id, nrow(pts_sel))
+    pts_sel$city_name <- rep(if ("name" %in% names(city_poly)) city_poly$name else as.character(city_id), nrow(pts_sel))
+    pts_sel$LCZ_center <- sel_df$LCZ_class
+    pts_sel$OSM_center <- sel_df$OSM_class
+    pts_sel$ID_plot <- paste0(as.character(city_id), "_", seq_len(nrow(pts_sel)))
+    squares$ID_plot <- pts_sel$ID_plot
+    # compute percent cover for each square (LCZ and OSM)
+    stats_list <- lapply(seq_len(nrow(squares)), function(j) {
+      sq <- squares[j, ]
+      lcz_tab <- percent_cover_in_polygon(LCZ, sq)
+      osm_tab <- percent_cover_in_polygon(OSM, sq)
+      tibble(
+        ID_plot = squares$ID_plot[j],
+        city_id = city_id,
+        x = sel_df$x[j],
+        y = sel_df$y[j],
+        LCZ_center = sel_df$LCZ_class[j],
+        OSM_center = sel_df$OSM_class[j],
+        LCZ_cover = list(lcz_tab),
+        OSM_cover = list(osm_tab)
+      )
+    })
+    stats_df <- bind_rows(stats_list)
+    # collect outputs
+    all_points <- rbind(all_points, pts_sel)
+    all_squares <- rbind(all_squares, squares)
+    plot_stats[[as.character(city_id)]] <- stats_df
+  } # end city loop
+
+  # combine stats
+  stats_combined <- bind_rows(plot_stats, .id = "city_id_list") %>%
+    select(-city_id_list)
+
+  # optional export
+  if (export_gpkg) {
+    if (!dir.exists(export_folder)) dir.create(export_folder)
+    gpkg_pts <- file.path(export_folder, paste0(export_name_prefix, "_points.gpkg"))
+    gpkg_sq  <- file.path(export_folder, paste0(export_name_prefix, "_squares.gpkg"))
+    writeVector(all_points, gpkg_pts, overwrite = TRUE)
+    writeVector(all_squares, gpkg_sq, overwrite = TRUE)
+  }
+
+  list(
+    points = all_points,
+    squares = all_squares,
+    stats = stats_combined
+  )
+}
+```
+
+2.2 Run functions
+```{r}
+
+
+# Select desired provinces
+# fid list:
+# 1. Brussel; 2. Luik /Liège; 3. Aarlen/Arlon; 4. Leuven; 5. Namen/Namur; 6. Bergen/Mons; 7. Gent; 8. Brugge; 9. Hasselt; 10. Waver/Wavre; 11. Antwerpen; 12. Oostende
+Provinces <- c(1, 2, 4, 9)
+Study_area_sub <- Study_area[Study_area$fid %in% Provinces, ]
+
+res_plots <- sample_plots_per_city(
+  Study_area = Study_area_sub,
+  LCZ = LCZ,
+  OSM = OSM,
+  city_id_field = "fid",
+  cities = NULL,
+  n_plots_city = 20,
+  plot_size = 100,
+  seed = 42,
+  use_strata = TRUE,
+  strata_vars = c("LCZ_class", "OSM_class"),
+  strata_mode = "proportional",
+  n_candidates = 2000,
+  allowed_osm = NULL,
+  export_gpkg = TRUE,
+  export_folder = "exports",
+  export_name_prefix = "veg_plots"
+)
+
+# outputs
+res_plots$points     # SpatVector of center points with attributes
+res_plots$squares    # SpatVector of 100x100 polygons
+res_plots$stats      # tibble with LCZ/OSM center and percent-cover tables per plot
+
+```
+
+
+
+
+
+
+
+Helper functions
+```{r}
+library(terra)
+library(dplyr)
+library(tidyr)
+
+#--------------------------------------------------
+# Select cities
+#--------------------------------------------------
+Study_area$city <- toupper(
+  dplyr::coalesce(
+    as.character(Study_area$mun_name_1_2),
+    as.character(Study_area$mun_name_1),
+    as.character(Study_area$mun_name_f),
+    as.character(Study_area$mun_name_n)
+  )
+)
+Study_area$city[Study_area$city %in% c(
+  "WATERMAAL-BOSVOORDE",
+  "WATERMAEL-BOITSFORT",
+  "BRUSSEL",
+  "BRUXELLES"
+)] <- "BRUSSEL"
+
+selected_cities <- c("BRUSSEL", "LUIK", "LEUVEN", "HASSELT")
+
+Study_area_sub <- Study_area[
+  Study_area$city %in% selected_cities,
+]
+
+#--------------------------------------------------
+# Create 100x100 m square around point
+#--------------------------------------------------
+make_square <- function(x, y, size = 100) {
+
+  half <- size / 2
+
+  coords <- matrix(
+    c(
+      x-half, y-half,
+      x+half, y-half,
+      x+half, y+half,
+      x-half, y+half,
+      x-half, y-half
+    ),
+    ncol = 2,
+    byrow = TRUE
+  )
+
+  vect(
+    list(coords),
+    type = "polygons"
+  )
+}
+
+#--------------------------------------------------
+# Cover percentages
+#--------------------------------------------------
+cover_percentages <- function(r, poly, prefix) {
+
+  vals <- values(
+    mask(
+      crop(r, poly),
+      poly
+    )
+  )
+
+  vals <- vals[!is.na(vals)]
+
+  if(length(vals) == 0) {
+    return(data.frame())
+  }
+
+  out <- prop.table(table(vals)) * 100
+
+  out <- data.frame(
+    class = names(out),
+    pct = as.numeric(out)
+  )
+
+  names(out)[2] <- "pct"
+
+  out |>
+    mutate(var = paste0(prefix, "_", class)) |>
+    select(var, pct) |>
+    pivot_wider(
+      names_from = var,
+      values_from = pct,
+      values_fill = 0
+    )
+}
+```
+
+
+Balanced sampler
+```{r}
+sample_city_plots <- function(
+    city_poly,
+    LCZ,
+    OSM,
+    city_id,
+    n_plots = 20,
+    plot_size = 100,
+    min_distance = 100,
+    n_candidates = 10000,
+    allowed_osm = NULL,
+    seed = 42
+) {
+
+  set.seed(seed)
+
+  half_size <- plot_size / 2
+
+  #--------------------------------------------------
+  # Shrink city boundary
+  #--------------------------------------------------
+
+  city_inner <- buffer(city_poly, -half_size)
+
+  if(nrow(city_inner) == 0) {
+    warning(paste("City", city_id, "too small"))
+    return(NULL)
+  }
+
+  #--------------------------------------------------
+  # Candidate points
+  #--------------------------------------------------
+
+  pts <- spatSample(
+    city_inner,
+    size = n_candidates,
+    method = "random"
+  )
+
+  cand <- as.data.frame(pts, geom = "XY")
+
+  cand$id <- seq_len(nrow(cand))
+
+  cand$LCZ <- terra::extract(LCZ, pts)[,2]
+  cand$OSM <- terra::extract(OSM, pts)[,2]
+
+  cand <- cand |>
+    filter(
+      !is.na(LCZ),
+      !is.na(OSM)
+    )
+
+  if(!is.null(allowed_osm)) {
+    cand <- cand |>
+      filter(OSM %in% allowed_osm)
+  }
+
+  if(nrow(cand) == 0) {
+    return(NULL)
+  }
+
+  #--------------------------------------------------
+  # Target distributions
+  #--------------------------------------------------
+
+  lcz_classes <- sort(unique(cand$LCZ))
+  osm_classes <- sort(unique(cand$OSM))
+
+  target_lcz <- setNames(
+    rep(n_plots / length(lcz_classes),
+        length(lcz_classes)),
+    lcz_classes
+  )
+
+  target_osm <- setNames(
+    rep(n_plots / length(osm_classes),
+        length(osm_classes)),
+    osm_classes
+  )
+
+  selected <- integer()
+
+  lcz_count <- setNames(
+    rep(0, length(lcz_classes)),
+    lcz_classes
+  )
+
+  osm_count <- setNames(
+    rep(0, length(osm_classes)),
+    osm_classes
+  )
+
+  #--------------------------------------------------
+  # Balanced greedy selection
+  #--------------------------------------------------
+
+  while(length(selected) < n_plots) {
+
+    remaining <- cand |>
+      filter(!(id %in% selected))
+
+    if(nrow(remaining) == 0) break
+
+    scores <- rep(0, nrow(remaining))
+
+    for(i in seq_len(nrow(remaining))) {
+
+      lcz <- as.character(remaining$LCZ[i])
+      osm <- as.character(remaining$OSM[i])
+
+      lcz_deficit <- target_lcz[lcz] - lcz_count[lcz]
+      osm_deficit <- target_osm[osm] - osm_count[osm]
+
+      scores[i] <- lcz_deficit + osm_deficit
+    }
+
+    remaining$score <- scores
+
+    remaining <- remaining |>
+      arrange(desc(score))
+
+    chosen <- NULL
+
+    for(i in seq_len(nrow(remaining))) {
+
+      candidate <- remaining[i,]
+
+      if(length(selected) == 0) {
+
+        chosen <- candidate
+        break
+
+      }
+
+      sel <- cand[cand$id %in% selected,]
+
+      d <- sqrt(
+        (sel$x - candidate$x)^2 +
+        (sel$y - candidate$y)^2
+      )
+
+      if(min(d) >= min_distance) {
+
+        chosen <- candidate
+        break
+
+      }
+    }
+
+    if(is.null(chosen)) break
+
+    selected <- c(selected, chosen$id)
+
+    lcz_count[as.character(chosen$LCZ)] <-
+      lcz_count[as.character(chosen$LCZ)] + 1
+
+    osm_count[as.character(chosen$OSM)] <-
+      osm_count[as.character(chosen$OSM)] + 1
+  }
+
+  selected_df <- cand |>
+    filter(id %in% selected)
+
+  #--------------------------------------------------
+  # Points
+  #--------------------------------------------------
+
+  points <- vect(
+    selected_df,
+    geom = c("x","y"),
+    crs = crs(city_poly)
+  )
+
+  points$city_id <- city_id
+
+  #--------------------------------------------------
+  # Squares
+  #--------------------------------------------------
+
+  sq_list <- lapply(
+    seq_len(nrow(selected_df)),
+    function(i) {
+
+      sq <- make_square(
+        selected_df$x[i],
+        selected_df$y[i],
+        plot_size
+      )
+
+      crs(sq) <- crs(city_poly)
+
+      sq
+    }
+  )
+
+  squares <- do.call(rbind, sq_list)
+
+  squares$plot_id <- paste0(
+    city_id,
+    "_",
+    seq_len(nrow(squares))
+  )
+
+  #--------------------------------------------------
+  # Plot statistics
+  #--------------------------------------------------
+
+  stats <- vector(
+    "list",
+    nrow(squares)
+  )
+
+  for(i in seq_len(nrow(squares))) {
+
+    sq <- squares[i,]
+
+    lcz_cov <- cover_percentages(
+      LCZ,
+      sq,
+      "LCZ"
+    )
+
+    osm_cov <- cover_percentages(
+      OSM,
+      sq,
+      "OSM"
+    )
+
+    stats[[i]] <- bind_cols(
+
+      data.frame(
+
+        plot_id = squares$plot_id[i],
+
+        city_id = city_id,
+
+        x = selected_df$x[i],
+
+        y = selected_df$y[i],
+
+        LCZ_center = selected_df$LCZ[i],
+
+        OSM_center = selected_df$OSM[i]
+      ),
+
+      lcz_cov,
+      osm_cov
+    )
+  }
+
+  stats <- bind_rows(stats)
+
+  list(
+    points = points,
+    squares = squares,
+    stats = stats,
+    lcz_distribution = lcz_count,
+    osm_distribution = osm_count
+  )
+}
+```
+
+Run for all cities
+```{r}
+all_points <- NULL
+all_squares <- NULL
+all_stats <- list()
+
+for(i in seq_len(nrow(Study_area_sub))) {
+
+  city <- Study_area_sub[i,]
+
+  city_id <- city$fid
+
+  res <- sample_city_plots(
+
+    city_poly = city,
+
+    LCZ = LCZ,
+
+    OSM = OSM,
+
+    city_id = city_id,
+
+    n_plots = 20,
+
+    plot_size = 100,
+
+    min_distance = 150,
+
+    n_candidates = 10000,
+
+    allowed_osm = c(1,2,3,4),
+
+    seed = 42 + i
+  )
+
+  if(is.null(res)) next
+
+  if(is.null(all_points)) {
+    all_points <- res$points
+  } else {
+    all_points <- rbind(all_points, res$points)
+  }
+
+  if(is.null(all_squares)) {
+    all_squares <- res$squares
+  } else {
+    all_squares <- rbind(all_squares, res$squares)
+  }
+
+  all_stats[[as.character(city_id)]] <- res$stats
+
+  cat(
+    "\nCity:",
+    city_id,
+    "\nLCZ:",
+    paste(names(res$lcz_distribution),
+          res$lcz_distribution,
+          collapse = ", "),
+    "\nOSM:",
+    paste(names(res$osm_distribution),
+          res$osm_distribution,
+          collapse = ", "),
+    "\n"
+  )
+}
+
+all_stats <- bind_rows(all_stats)
+```
+
+Export
+```{r}
+writeVector(
+  all_points,
+  "exports/veg_plot_points.gpkg",
+  overwrite = TRUE
+)
+
+writeVector(
+  all_squares,
+  "exports/veg_plot_squares.gpkg",
+  overwrite = TRUE
+)
+
+write.csv(
+  all_stats,
+  "exports/veg_plot_statistics.csv",
+  row.names = FALSE
+)
+```
+

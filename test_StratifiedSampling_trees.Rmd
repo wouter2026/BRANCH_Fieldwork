@@ -1,0 +1,372 @@
+---
+title: "BRANCH - Stratified sampling - trees"
+author: "Eva Beele"
+date: "2026-06-17"
+output: html_document
+---
+
+
+```{r}
+library(sf)
+library(terra)
+library(dplyr)
+library(stringr)
+```
+
+```{r}
+# USER SETTINGS 
+
+target_crs <- 31370
+
+n_trees_per_stratum <- 30
+```
+
+```{r}
+# LCZ CLASSIFICATION
+reclassify_lcz <- function(lcz){
+
+  rcl <- matrix(c(
+    1, 3, 1,    # Urban
+    4, 10, 2,   # Suburban
+    11, 17, 3   # Rural
+  ),
+  ncol = 3,
+  byrow = TRUE)
+
+  classify(lcz, rcl) |>
+    setNames("LCZ_class")
+}
+```
+
+```{r}
+# LAND USE HARMONISATION 
+
+harmonize_landuse <- function(lu, region){
+
+  if(region == "Flanders"){
+
+
+    lookup <- data.frame(
+      from = c(
+        1,2,3,4,5,6,7,8,11,
+        9,10,12,13,14,15,16,17,18,19
+      ),
+
+      to = c(
+        rep(1,9),   # Built-up
+        rep(2,10)   # Natural
+      )
+    )
+
+
+  } else if(region == "Wallonia"){
+
+
+    stop("Add Wallonia land-use lookup table")
+
+
+  } else if(region == "Brussels"){
+
+
+    stop("Add Brussels land-use lookup table")
+
+  }
+
+
+  lu_class <- terra::classify(
+    lu,
+    rcl = as.matrix(lookup)
+  )
+
+  lu_class <- as.factor(lu_class)
+
+ # convert numeric classes to labels
+  levels(lu_class) <- data.frame(
+    ID = c(1,2),
+    LU_class = c(
+      "Built-up",
+      "Natural"
+    )
+  )
+
+
+  names(lu_class) <- "LU_class"
+
+
+  return(lu_class)
+
+}
+```
+
+```{r}
+# SAMPLING FUNCTION
+
+run_sampling <- function(
+    city,
+    region,
+    trees_fp,
+    lcz_fp,
+    lu_fp,
+){
+ 
+   message("Reading data...")
+
+  trees <- st_read(
+    trees_fp,
+    quiet = TRUE
+  )
+  lcz <- rast(lcz_fp)
+  lu <- rast(lu_fp)
+
+
+
+  # align CRS
+  trees <- st_transform(
+    trees,
+    crs(lcz)
+  )
+
+
+  message("Classifying rasters LCZ...")
+  lcz_class <- reclassify_lcz(lcz)
+  
+  message("Classifying rasters LU...")
+  lu_class <- harmonize_landuse(
+    lu,
+    region
+  )
+
+  
+  message("Extracting raster classes...")
+
+  trees$LCZ_class <-
+    terra::extract(
+      lcz_class,
+      vect(trees)
+    )[,2]
+
+  trees$LU_class <-
+    terra::extract(
+      lu_class,
+      vect(trees)
+    )[,2]
+
+
+
+  # strata
+  trees <- trees |>
+    mutate(
+      strata =
+        paste(
+          LCZ_class,
+          LU_class,
+          sep="_"
+        )
+    )
+
+
+  # sample
+  sampled <- trees |>
+    group_by(strata) |>
+    slice_sample(
+      n = min(n_trees_per_stratum, n())
+    ) |>
+    ungroup()
+
+  st_write(
+    sampled,
+    output_fp,
+    delete_dsn = TRUE,
+    quiet = TRUE
+  )
+
+  return(sampled)
+
+}
+```
+
+
+# Leuven
+```{r}
+sample_leuven <- run_sampling(
+  city = "Leuven",
+  region = "Flanders",
+
+  trees_fp = "C:/Users/u0138370/OneDrive - KU Leuven/EES-FNL-BRANCH - 1. Data/In-situ_data/1_Municipal_inventories/Leuven/Boomvorm.shp",
+
+  lcz_fp = "C:/Users/u0138370/OneDrive - KU Leuven/EES-FNL-BRANCH - 1. Data/Sampling_design/LCZ/EU_LCZ_map_Belgium.tif",
+
+  lu_fp = "C:/Users/u0138370/OneDrive - KU Leuven/EES-FNL-BRANCH - 1. Data/Sampling_design/Landuse/lu_landgebruik_vlaa_2022_v3/lu_landgebruik_vlaa_2022_v3.tif",
+
+  output_fp = "C:/Users/u0138370/OneDrive - KU Leuven/EES-FNL-BRANCH - 1. Data/Sampling_design/R/Output/leuven_sample.gpkg"
+)
+```
+
+
+```{r}
+library(sf)
+library(terra)
+library(dplyr)
+library(stringr)
+library(tidyr)
+```
+
+```{r}
+# User settings
+city <- "Leuven"
+
+n_clusters_per_stratum <- 10
+n_trees_per_cluster <- 3
+
+grid_size <- 250      # meter
+min_tree_distance <- 25 # meter
+
+target_crs <- 31370
+```
+
+
+# 1. IMPORT DATA
+```{r}
+# Municipality tree database
+trees_ <- st_read("C:/Users/u0138370/OneDrive - KU Leuven/EES-FNL-BRANCH - 1. Data/In-situ_data/1_Municipal_inventories/Leuven/Boomvorm.shp")
+
+# LCZ Belgium
+lcz <- rast("C:/Users/u0138370/OneDrive - KU Leuven/EES-FNL-BRANCH - 1. Data/Sampling_design/LCZ/EU_LCZ_map_Belgium.tif")
+
+# Land use
+landuse_Vlaanderen <- rast("C:/Users/u0138370/OneDrive - KU Leuven/EES-FNL-BRANCH - 1. Data/Sampling_design/Landuse/lu_landgebruik_vlaa_2022_v3/lu_landgebruik_vlaa_2022_v3.tif")
+
+#Study area
+ROI <- 
+
+# Check CRS
+st_crs(trees_leuven)
+crs(lcz)
+crs(landuse_Vlaanderen)
+```
+
+# 2. LCZ RECLASSIFICATION
+```{r}
+lcz_reclass <- matrix(c(
+  1, 3, 1,   # Urban
+  4, 10, 2,  # Suburban
+  11, 17, 3  # Rural
+), ncol = 3, byrow = TRUE)
+
+lcz_class <- classify(lcz, lcz_reclass)
+
+names(lcz_class) <- "LCZ_class"
+
+lcz_levels <- data.frame(
+  ID = 1:3,
+  LCZ_label = c("Urban", "Suburban", "Rural")
+)
+```
+
+# 3. LAND USE RECLASSIFICATION
+# Flanders
+```{r}
+qml_df <- read.table(text = "
+1 Huize_en_tuinen
+2 Industrie
+3 Commerciële_doeleinden
+4 Diensten
+5 Transportinfrastructuur
+6 Recreatie
+7 Landbouwgebouwen_en_-infrastructuur
+8 Overige_bebouwde_terreinen
+9 Overige_onbebouwde_terreinen
+10 Actieve_groeves
+11 Luchthavens
+12 Bos
+13 Akker
+14 Grasland_in_landbouwgebruik
+15 Struikgewas
+16 Braakliggend_en_duinen
+17 Water
+18 Moeras
+19 Overige_graslanden
+", header = FALSE)
+
+colnames(qml_df) <- c("value", "label")
+
+
+qml_df <- qml_df %>%
+  mutate(
+    LU_class = case_when(
+
+      # Built-up
+      label %in% c(
+        "Huize_en_tuinen",
+        "Industrie",
+        "Commerciële_doeleinden",
+        "Diensten",
+        "Transportinfrastructuur",
+        "Recreatie",
+        "Landbouwgebouwen_en_-infrastructuur",
+        "Overige_bebouwde_terreinen",
+        "Luchthavens"
+      ) ~ "Built-up",
+
+      # Natural
+      label %in% c(
+        "Overige_onbebouwde_terreinen",
+        "Actieve_groeves",
+        "Bos",
+        "Akker",
+        "Grasland_in_landbouwgebruik",
+        "Struikgewas",
+        "Braakliggend_en_duinen",
+        "Water",
+        "Moeras",
+        "Overige_graslanden"
+      ) ~ "Natural",
+
+      TRUE ~ NA_character_
+    )
+  )
+
+unique(values(landuse_Vlaanderen))
+
+```
+
+```{r}
+trees_lu <- terra::extract(landuse_Vlaanderen, vect(trees_leuven))
+trees
+```
+
+
+# WRAPPER
+```{r}
+
+run_sampling <- function(city, region, trees_fp, lcz_fp, lu_fp){
+
+  trees <- st_read(trees_fp)
+  lcz <- rast(lcz_fp)
+  lu <- st_read(lu_fp)
+
+  trees <- st_transform(trees, crs(lcz))
+  lu <- st_transform(lu, crs(lcz))
+
+  lu <- harmonize_landuse(lu, region)
+
+  lcz_class <- classify(lcz, lcz_reclass)
+
+  trees_lcz <- terra::extract(lcz_class, vect(trees)) %>%
+    bind_cols(trees)
+
+  trees_full <- st_join(trees_lcz, lu["LU_class"])
+
+  trees_full <- trees_full %>%
+    mutate(strata = paste0(LCZ_class, "_", LU_class))
+
+  sampled <- trees_full %>%
+    group_by(strata) %>%
+    slice_sample(n = min(30, n()))
+
+  st_write(sampled, paste0("output/sample_", city, ".shp"))
+}
+
+```
+
+ 

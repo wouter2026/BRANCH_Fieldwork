@@ -1,0 +1,477 @@
+---
+title: "Tree_sampling"
+author: "Wouter Strauven"
+date: "2026-06-23"
+output: html_document
+---
+
+0. Setup
+```{r setup}
+# Libraries
+library(terra)
+library(dplyr)
+library(stringr)
+
+```
+
+1. Read stratification layers
+```{r}
+# Read in stratification layers
+LCZ <- rast("Output/LCZ_3classes.tif")
+OSM <- rast("Output/OSM_raster_10m.tif")
+
+# Inspect
+LCZ
+OSM
+crs(LCZ)
+crs(OSM)
+
+# Fix crs
+crs(OSM) <- "EPSG:31370"
+OSM <- project(OSM, LCZ)
+
+# Provide unique names for columns
+names(LCZ) <- "LCZ_class"
+names(OSM) <- "OSM_class"
+
+```
+
+2. Read tree layers per city and unify into one dataset
+```{r}
+# --- 1. Read tree layers ---
+
+# Brussel (2 layers)
+brussel_mobil_trees <- vect("F:/KULeuven/BRANCH/Materials_and_methods/Data/In-situ_data/1_Municipal_inventories/Brussels/trees_2026_BrusselMobiliteit.gpkg")
+
+brussel_stad_trees  <- vect("F:/KULeuven/BRANCH/Materials_and_methods/Data/In-situ_data/1_Municipal_inventories/Brussels/arbres-bomen-vbx-be-bm_2026_StadBrussel.geojson")
+brussel_stad_trees <- disagg(brussel_stad_trees) # Fix multi-point (ID 709 = 3 geometries --> VERIFY!!)
+
+# Hasselt
+hasselt_trees <- vect("F:/KULeuven/BRANCH/Materials_and_methods/Data/In-situ_data/1_Municipal_inventories/Hasselt/Hasselt_Runkst.gpkg")
+
+# Liège
+liege_trees <- vect("F:/KULeuven/BRANCH/Materials_and_methods/Data/In-situ_data/1_Municipal_inventories/Liege/arbustum.geojson")
+
+# Leuven
+leuven_trees <- vect("F:/KULeuven/BRANCH/Materials_and_methods/Data/In-situ_data/1_Municipal_inventories/Leuven/Boomvorm.shp")
+
+# --- 2. Check that all layers match the Belgian Lambert 72 CRQ ---
+# Inspect CRS
+crs(brussel_mobil_trees)
+crs(brussel_stad_trees)
+crs(hasselt_trees)
+crs(liege_trees)
+crs(leuven_trees)
+
+# Reproject to Belgian Lambert 72 (same CRS as LCZ)
+brussel_mobil_trees <- project(brussel_mobil_trees, LCZ)
+brussel_stad_trees <- project(brussel_stad_trees, LCZ)
+hasselt_trees <- project(hasselt_trees, LCZ)
+liege_trees <- project(liege_trees, LCZ)
+leuven_trees <- project(leuven_trees, LCZ)
+
+# --- 3. Unify species column names and bind cities into one dataset---
+# Inspect column names
+names(brussel_mobil_trees)
+names(brussel_stad_trees)
+names(hasselt_trees)
+names(liege_trees)
+names(leuven_trees)
+
+# Unify species columns and add city column
+brussel_stad_trees$species_raw <- brussel_stad_trees$species
+brussel_stad_trees$city <- "Brussels"
+
+brussel_mobil_trees$species_raw <- brussel_mobil_trees$essence
+brussel_mobil_trees$city <- "Brussels"
+
+hasselt_trees$species_raw <- hasselt_trees$boomsoor
+hasselt_trees$city <- "Hasselt"
+
+liege_trees$species_raw <- liege_trees$tree_species
+liege_trees$city <- "Liege"
+
+leuven_trees$species_raw <- leuven_trees$wetenschap
+leuven_trees$city <- "Leuven"
+
+# Bind cities into one dataset
+trees_all <- rbind(
+  brussel_stad_trees,
+  brussel_mobil_trees,
+  hasselt_trees,
+  liege_trees,
+  leuven_trees
+)
+
+# Inspect
+names(trees_all)
+head(trees_all$species_raw)
+```
+
+3. Extract genus (VERIFY!!)
+```{r}
+extract_genus <- function(vect) {
+  vect$genus <- vect$species_raw |>
+    as.character() |>
+    stringr::str_trim() |>
+    stringr::str_split_fixed(" ", n = 2) |>
+    (\(m) m[,1])()
+  
+  vect
+}
+
+# Apply to merged dataset
+trees_all <- extract_genus(trees_all)
+
+# Apply to each city
+brussel_stad_trees  <- extract_genus(brussel_stad_trees)
+brussel_mobil_trees <- extract_genus(brussel_mobil_trees)
+hasselt_trees       <- extract_genus(hasselt_trees)
+liege_trees         <- extract_genus(liege_trees)
+leuven_trees        <- extract_genus(leuven_trees)
+
+```
+
+4. Extract OSM and LCZ for each tree
+```{r}
+# Robust extraction function
+extract_LCZ_OSM <- function(vect, LCZ, OSM) {
+  
+  # 1. Reproject to LCZ CRS
+  vect <- project(vect, LCZ)
+  
+  # 2. Extract LCZ and OSM values
+  lcz_vals <- terra::extract(LCZ, vect)[, "LCZ_class", drop = TRUE]
+  osm_vals <- terra::extract(OSM, vect)[, "OSM_class", drop = TRUE]
+  
+  # 3. Attach to vector
+  vect$LCZ_class <- lcz_vals
+  vect$OSM_class <- osm_vals
+  
+  vect
+}
+
+# Apply to merged dataset
+trees_all <- extract_LCZ_OSM(trees_all, LCZ, OSM)
+
+# Apply to each city
+brussel_stad_trees_extracted  <- extract_LCZ_OSM(brussel_stad_trees,  LCZ, OSM)
+brussel_mobil_trees_extracted <- extract_LCZ_OSM(brussel_mobil_trees, LCZ, OSM)
+hasselt_trees_extracted       <- extract_LCZ_OSM(hasselt_trees,       LCZ, OSM)
+liege_trees_extracted         <- extract_LCZ_OSM(liege_trees,         LCZ, OSM)
+leuven_trees_extracted        <- extract_LCZ_OSM(leuven_trees,        LCZ, OSM)
+
+
+```
+
+5. Statistics
+```{r}
+# Convert to data.frame for dplyr (keeping geometry in terra object)
+trees_df <- as.data.frame(trees_all, geom = "XY")
+
+# --- LCZ distribution ---
+lcz_stats <- trees_df %>%
+  count(LCZ_class, name = "n") %>%
+  mutate(pct = 100 * n / sum(n))
+
+lcz_stats
+
+
+# --- OSM distribution ---
+osm_stats <- trees_df %>%
+  count(OSM_class, name = "n") %>%
+  mutate(pct = 100 * n / sum(n))
+
+osm_stats
+
+
+# --- Genus counts overall ---
+genus_stats <- trees_df %>%
+  count(genus, name = "n") %>%
+  arrange(desc(n))
+
+head(genus_stats, 30)
+
+
+# --- Genus by city ---
+genus_city_stats <- trees_df %>%
+  count(city, genus, name = "n") %>%
+  group_by(city) %>%
+  mutate(pct = 100 * n / sum(n)) %>%
+  ungroup()
+
+head(genus_city_stats, 30)
+
+
+# --- Genus by LCZ and OSM (large table) ---
+genus_lcz_osm_stats <- trees_df %>%
+  count(genus, LCZ_class, OSM_class, name = "n") %>%
+  arrange(genus, LCZ_class, OSM_class)
+
+head(genus_lcz_osm_stats, 30)
+
+```
+6. Sampling
+```{r}
+
+### Main sampling function ###
+library(terra)
+library(dplyr)
+library(tidyr)
+library(rlang)
+
+sample_trees <- function(
+  trees_all,
+  seed = 1234,
+  n_stad_ronde1  = 200,
+  n_stad_ronde2  = 50,
+  n_totaal_ronde1 = 800,
+  n_totaal_ronde2 = 200,
+  n_min_genus = 5,
+  use_strata = TRUE,
+  strata_vars = c("LCZ_class", "OSM_class"),
+  strata_mode = c("proportional", "equal")
+) {
+  set.seed(seed)
+  strata_mode <- match.arg(strata_mode)
+  if (!inherits(trees_all, "SpatVector")) stop("trees_all must be a SpatVector")
+  if (!"ID" %in% names(trees_all)) trees_all$ID <- seq_len(nrow(trees_all))
+  if (!"sample_round" %in% names(trees_all)) trees_all$sample_round <- 0L
+
+  # build strata on df side
+  df_all <- as.data.frame(trees_all)
+  if (use_strata) {
+    missing_vars <- setdiff(strata_vars, names(df_all))
+    if (length(missing_vars) > 0) stop("Missing strata variables: ", paste(missing_vars, collapse = ", "))
+    df_all <- df_all %>% mutate(strata = interaction(!!!syms(strata_vars), drop = TRUE))
+  } else {
+    df_all <- df_all %>% mutate(strata = factor("all"))
+  }
+  trees_all$strata <- df_all$strata
+
+  # helpers
+  compute_city_capacity <- function(df, n_per_city) {
+    df %>% count(city, name = "n_current") %>%
+      mutate(capacity = pmax(n_per_city - n_current, 0L)) %>%
+      select(city, capacity)
+  }
+
+  safe_slice_sample <- function(df, n) {
+    # ensure n is scalar
+    if (length(n) > 1) n <- n[1]
+    if (is.na(n) || n <= 0) return(df[0, , drop = FALSE])
+    n_avail <- nrow(df)
+    if (n_avail == 0) return(df[0, , drop = FALSE])
+    n_draw <- min(n, n_avail)
+    df %>% slice_sample(n = n_draw)
+  }
+
+  df <- as.data.frame(trees_all)
+
+  # ROUND 1: minimum per genus (respect city caps)
+  city_cap_r1 <- tibble(city = unique(df$city), capacity = n_stad_ronde1)
+  selected_ids_r1 <- integer(0)
+  genera <- unique(df$genus)
+  total_selected <- 0L
+
+  for (g in genera) {
+    if (total_selected >= n_totaal_ronde1) break
+    cand <- df %>% filter(sample_round == 0, genus == g)
+    if (nrow(cand) == 0) next
+    cand <- cand %>% left_join(city_cap_r1, by = "city") %>% filter(capacity > 0)
+    if (nrow(cand) == 0) next
+    n_target <- min(n_min_genus, nrow(cand), n_totaal_ronde1 - total_selected)
+    if (n_target <= 0) next
+    s <- cand %>% slice_sample(n = n_target)
+    selected_ids_r1 <- c(selected_ids_r1, s$ID)
+    used <- s %>% count(city, name = "used")
+    city_cap_r1 <- city_cap_r1 %>%
+      left_join(used, by = "city") %>%
+      mutate(used = replace_na(used, 0L),
+             capacity = pmax(capacity - used, 0L)) %>%
+      select(city, capacity)
+    total_selected <- length(selected_ids_r1)
+  }
+
+  trees_all$sample_round[trees_all$ID %in% selected_ids_r1] <- 1L
+  df <- as.data.frame(trees_all)
+
+  # ROUND 1: fill remaining slots (stratified or random), respecting city caps
+  remaining_slots_r1 <- max(n_totaal_ronde1 - sum(df$sample_round == 1), 0)
+  if (remaining_slots_r1 > 0) {
+    city_cap_r1 <- compute_city_capacity(df %>% filter(sample_round == 1), n_stad_ronde1)
+    pool <- df %>% filter(sample_round == 0) %>% left_join(city_cap_r1, by = "city") %>% filter(capacity > 0)
+    if (nrow(pool) > 0) {
+      if (use_strata) {
+        pool_counts <- pool %>% count(strata, name = "n_stratum")
+        if (strata_mode == "proportional") {
+          pool_counts <- pool_counts %>%
+            mutate(alloc = pmax(1, round(n_stratum / sum(n_stratum) * remaining_slots_r1)))
+        } else { # equal
+          n_strata <- n_distinct(pool$strata)
+          per_stratum <- ceiling(remaining_slots_r1 / n_strata)
+          pool_counts <- pool_counts %>% mutate(alloc = per_stratum)
+        }
+        # join alloc back to pool and sample per group using scalar alloc
+        pool <- pool %>% left_join(pool_counts %>% select(strata, alloc), by = "strata")
+        picks <- pool %>% group_by(strata) %>%
+          group_modify(~ safe_slice_sample(.x, unique(.x$alloc))) %>%
+          ungroup()
+      } else {
+        picks <- safe_slice_sample(pool, remaining_slots_r1)
+      }
+      ids_r1_extra <- picks$ID
+      trees_all$sample_round[trees_all$ID %in% ids_r1_extra] <- 1L
+      df <- as.data.frame(trees_all)
+    }
+  }
+
+  # ROUND 2: per-city extra caps
+  df <- as.data.frame(trees_all)
+  pool2 <- df %>% filter(sample_round == 0)
+  if (nrow(pool2) > 0 && n_totaal_ronde2 > 0) {
+    city_cap_r2 <- tibble(city = unique(df$city)) %>% mutate(capacity = n_stad_ronde2)
+    pool2 <- pool2 %>% left_join(city_cap_r2, by = "city") %>% filter(capacity > 0)
+    if (nrow(pool2) > 0) {
+      remaining_slots_r2 <- n_totaal_ronde2
+      if (use_strata) {
+        pool2_counts <- pool2 %>% count(strata, name = "n_stratum")
+        if (strata_mode == "proportional") {
+          pool2_counts <- pool2_counts %>% mutate(alloc = pmax(1, round(n_stratum / sum(n_stratum) * remaining_slots_r2)))
+        } else {
+          n_strata <- n_distinct(pool2$strata)
+          per_stratum <- ceiling(remaining_slots_r2 / n_strata)
+          pool2_counts <- pool2_counts %>% mutate(alloc = per_stratum)
+        }
+        pool2 <- pool2 %>% left_join(pool2_counts %>% select(strata, alloc), by = "strata")
+        picks2 <- pool2 %>% group_by(strata) %>%
+          group_modify(~ safe_slice_sample(.x, unique(.x$alloc))) %>%
+          ungroup()
+      } else {
+        picks2 <- safe_slice_sample(pool2, remaining_slots_r2)
+      }
+      ids_r2 <- picks2$ID
+      trees_all$sample_round[trees_all$ID %in% ids_r2] <- 2L
+      df <- as.data.frame(trees_all)
+    }
+  }
+
+  # Summaries
+  df_final <- as.data.frame(trees_all)
+  summary_by_city <- df_final %>%
+    count(city, sample_round) %>%
+    pivot_wider(names_from = sample_round, values_from = n, values_fill = 0) %>%
+    rename(not_sampled = `0`, round1 = `1`, round2 = `2`)
+  summary_by_genus <- df_final %>%
+    count(genus, sample_round) %>%
+    pivot_wider(names_from = sample_round, values_from = n, values_fill = 0) %>%
+    rename(not_sampled = `0`, round1 = `1`, round2 = `2`) %>%
+    arrange(desc(round1 + round2))
+  summary_by_strata <- df_final %>%
+    count(strata, sample_round) %>%
+    pivot_wider(names_from = sample_round, values_from = n, values_fill = 0) %>%
+    rename(not_sampled = `0`, round1 = `1`, round2 = `2`)
+
+  list(
+    trees = trees_all,
+    df = df_final,
+    summary_by_city = summary_by_city,
+    summary_by_genus = summary_by_genus,
+    summary_by_strata = summary_by_strata
+  )
+}
+
+
+### Using the function ###
+res <- sample_trees(
+  trees_all,
+  seed = 1234,
+  n_stad_ronde1 = 200,
+  n_stad_ronde2 = 50,
+  n_totaal_ronde1 = 800,
+  n_totaal_ronde2 = 200,
+  n_min_genus = 5,
+  use_strata = TRUE,
+  strata_vars = c("LCZ_class", "OSM_class"),
+  strata_mode = "proportional" # equal or proportional
+)
+
+# Updated SpatVector
+trees_all_sampled <- res$trees
+
+# Quick checks
+table(as.data.frame(trees_all_sampled)$sample_round)
+res$summary_by_city
+res$summary_by_genus
+res$summary_by_strata
+
+
+```
+
+
+7. Export
+```{r}
+#### CSV ####
+# Create function
+export_city <- function(vect, name, folder = "exports") {
+  if (!dir.exists(folder)) dir.create(folder)
+  
+  # Convert to data.frame with XY columns
+  df <- as.data.frame(vect, geom = "XY")
+  
+  # Build filename
+  file <- file.path(folder, paste0(name, ".csv"))
+  
+  # Write CSV
+  write.csv(df, file, row.names = FALSE)
+  
+  message("Exported: ", file)
+}
+
+# Export combined dataset
+export_city(trees_all, "trees_all")
+
+city_list <- list(
+  brussel_stad  = brussel_stad_trees_extracted,
+  brussel_mobil = brussel_mobil_trees_extracted,
+  hasselt       = hasselt_trees_extracted,
+  liege         = liege_trees_extracted,
+  leuven        = leuven_trees_extracted
+)
+
+# Export separate cities
+lapply(names(city_list), function(n) export_city(city_list[[n]], n))
+
+#### geopackage ####
+# Create function
+export_city_gpkg <- function(vect, name, folder = "exports") {
+  if (!dir.exists(folder)) dir.create(folder)
+  
+  file <- file.path(folder, paste0(name, ".gpkg"))
+  
+  # Write as GeoPackage
+  writeVector(vect, file, overwrite = TRUE)
+  
+  message("Exported spatial file: ", file)
+}
+
+# Export combined dataset
+export_city_gpkg(trees_all, "trees_all")
+
+# Export separate cities
+city_list <- list(
+  brussel_stad  = brussel_stad_trees_extracted,
+  brussel_mobil = brussel_mobil_trees_extracted,
+  hasselt       = hasselt_trees_extracted,
+  liege         = liege_trees_extracted,
+  leuven        = leuven_trees_extracted
+)
+
+lapply(names(city_list), function(n)
+  export_city_gpkg(city_list[[n]], n)
+)
+
+
+
+```
+

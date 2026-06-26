@@ -1,0 +1,77 @@
+---
+title: "OMS_raster"
+author: "Eva Beele"
+date: "2026-06-18"
+output: html_document
+---
+
+```{r}
+library(terra)
+
+# België-grens
+belgium <- vect("C:/Users/u0138370/OneDrive - KU Leuven/PhD_Research/Obj3_LandCover/ShapefileBelgium/régions_72.shp")
+
+# Rastertemplate voor heel België
+r <- rast(
+  ext(belgium),
+  resolution = 10,
+  crs = crs(belgium)
+)
+
+# Initialiseren met NA
+values(r) <- 0
+```
+```{r}
+library(terra)
+
+# Inlezen
+forest <- vect("C:/Users/u0138370/OneDrive - KU Leuven/EES-FNL-BRANCH - 1. Data/Sampling_design/OSM/OSM_Forest.gpkg")
+heath_scrub <- vect("C:/Users/u0138370/OneDrive - KU Leuven/EES-FNL-BRANCH - 1. Data/Sampling_design/OSM/OSM_Heath_Scrub.gpkg")
+meadow_grass <- vect("C:/Users/u0138370/OneDrive - KU Leuven/EES-FNL-BRANCH - 1. Data/Sampling_design/OSM/OSM_Meadow_Grass.gpkg")
+park_allotment <- vect("C:/Users/u0138370/OneDrive - KU Leuven/EES-FNL-BRANCH - 1. Data/Sampling_design/OSM/OSM_Park_Allotment.gpkg")
+park_dog_graveyard <- vect("C:/Users/u0138370/OneDrive - KU Leuven/EES-FNL-BRANCH - 1. Data/Sampling_design/OSM/OSM_Park_Dog_park_Graveyard.gpkg")
+national_park_nature_reserve <- vect("C:/Users/u0138370/OneDrive - KU Leuven/EES-FNL-BRANCH - 1. Data/Sampling_design/OSM/OSM_NationalPark_NatureReserve.gpkg")
+
+mixed <- rbind(park_allotment,park_dog_graveyard,national_park_nature_reserve)
+
+
+# Rasteriseren, nergens een OSM-object = NA 
+forest_r <- rasterize(forest, r, field = 1)
+heath_scrub_r <- rasterize(heath_scrub, r, field = 2)
+meadow_grass_r <- rasterize(meadow_grass, r, field = 3)
+mixed_r <- rasterize(mixed, r, field = 4)
+
+
+# Samenvoegen volgens prioriteit: Hier overschrijft elke nieuwe laag de onderliggende laag waar ze voorkomt.
+# cover() werkt juist op basis van NA's: waar buildings_r een waarde heeft, wordt die gebruikt; waar het NA is, wordt teruggevallen op de onderliggende laag.
+landcover <- mixed_r
+landcover <- cover(meadow_grass_r, landcover)
+landcover <- cover(heath_scrub_r, landcover)
+landcover <- cover(forest_r, landcover)
+
+# NAs omzetten naar restklasse
+landcover[is.na(landcover)] <- 0
+```
+```{r}
+library(terra)
+
+levels(landcover) <- data.frame(
+  value = 1:4,
+  class = c("High green", "Mid green", "Low green", "Mixed")
+)
+
+plot(
+  landcover,
+  main = "Landcover",
+  type = "classes"
+)
+freq(landcover)
+crs(landcover)
+
+writeRaster(
+  landcover,
+  "C:/Users/u0138370/OneDrive - KU Leuven/EES-FNL-BRANCH - 1. Data/Sampling_design/R/Output/OSM_raster_10m.tif",
+  overwrite = TRUE
+)
+```
+
