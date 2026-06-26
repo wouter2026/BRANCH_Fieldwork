@@ -1,0 +1,12 @@
+Suggetsion for Repo structure:
+
+Sampling_design/
+│
+├── R/                  # scripts (.R)
+├── Rmd/                # reports (.Rmd)
+├── data/               # raw data (usually NOT pushed or partially ignored)
+├── output/             # generated files
+├── figures/            # plots
+├── Sampling_design.Rproj
+├── .gitignore
+└── README.md

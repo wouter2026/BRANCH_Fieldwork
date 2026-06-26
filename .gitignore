@@ -1,4 +1,14 @@
+
+# R session files
 .Rhistory
 .RData
 .Ruserdata
 .Rproj.user/
+
+# outputs (optional but recommended)
+output/
+exports/
+
+# system files
+.DS_Store
+Thumbs.db
