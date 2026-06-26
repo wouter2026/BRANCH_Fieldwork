@@ -1,0 +1,8 @@
+{
+  "r.rpath.windows": "C:\\Program Files\\R\\R-4.5.1\\bin\\R.exe",
+  "r.rterm.windows": "C:\\Program Files\\R\\R-4.5.1\\bin\\R.exe",
+  "r.alwaysUseActiveTerminal": true,
+  "r.lsp.enabled": true,
+  "r.plot.useHttpgd": true,
+  "r.bracketedPaste": true
+}

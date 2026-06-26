@@ -7,6 +7,22 @@ output: html_document
 
 0. Setup
 ```{r setup}
+# Set knit root to the project folder so relative paths like Output/... resolve in VS Code.
+find_project_root <- function(start = getwd()) {
+  current <- normalizePath(start, winslash = "/", mustWork = TRUE)
+  repeat {
+    if (file.exists(file.path(current, "R.Rproj"))) return(current)
+    parent <- dirname(current)
+    if (identical(parent, current)) return(NULL)
+    current <- parent
+  }
+}
+
+project_root <- find_project_root()
+if (!is.null(project_root)) {
+  knitr::opts_knit$set(root.dir = project_root)
+}
+
 # Libraries
 library(terra)
 library(dplyr)
@@ -127,9 +143,9 @@ sample_plots_per_city <- function(
     Study_area <- Study_area[Study_area[[city_id_field]] %in% cities, ]
   }
 
-  # prepare outputs
-  all_points <- vect(crs = crs(Study_area)) # empty
-  all_squares <- vect(crs = crs(Study_area))
+  # prepare outputs (lazy init avoids terra::vect(crs=...) incompatibility)
+  all_points <- NULL
+  all_squares <- NULL
   plot_stats <- list()
   # iterate cities
   for (i in seq_len(nrow(Study_area))) {
@@ -245,17 +261,26 @@ sample_plots_per_city <- function(
     })
     stats_df <- bind_rows(stats_list)
     # collect outputs
-    all_points <- rbind(all_points, pts_sel)
-    all_squares <- rbind(all_squares, squares)
+    all_points <- if (is.null(all_points)) pts_sel else rbind(all_points, pts_sel)
+    all_squares <- if (is.null(all_squares)) squares else rbind(all_squares, squares)
     plot_stats[[as.character(city_id)]] <- stats_df
   } # end city loop
+
+  if (is.null(all_points) || is.null(all_squares)) {
+    warning("No plots were generated. Check selected cities and candidate settings.")
+    return(list(
+      points = NULL,
+      squares = NULL,
+      stats = tibble()
+    ))
+  }
 
   # combine stats
   stats_combined <- bind_rows(plot_stats, .id = "city_id_list") %>%
     select(-city_id_list)
 
   # optional export
-  if (export_gpkg) {
+  if (export_gpkg && !is.null(all_points) && !is.null(all_squares)) {
     if (!dir.exists(export_folder)) dir.create(export_folder)
     gpkg_pts <- file.path(export_folder, paste0(export_name_prefix, "_points.gpkg"))
     gpkg_sq  <- file.path(export_folder, paste0(export_name_prefix, "_squares.gpkg"))
@@ -741,22 +766,36 @@ all_stats <- bind_rows(all_stats)
 
 Export
 ```{r}
-writeVector(
-  all_points,
-  "exports/veg_plot_points.gpkg",
-  overwrite = TRUE
-)
+if (!dir.exists("exports")) dir.create("exports")
 
-writeVector(
-  all_squares,
-  "exports/veg_plot_squares.gpkg",
-  overwrite = TRUE
-)
+if (!is.null(all_points)) {
+  writeVector(
+    all_points,
+    "exports/veg_plot_points.gpkg",
+    overwrite = TRUE
+  )
+} else {
+  warning("No point plots to export.")
+}
 
-write.csv(
-  all_stats,
-  "exports/veg_plot_statistics.csv",
-  row.names = FALSE
-)
+if (!is.null(all_squares)) {
+  writeVector(
+    all_squares,
+    "exports/veg_plot_squares.gpkg",
+    overwrite = TRUE
+  )
+} else {
+  warning("No square plots to export.")
+}
+
+if (nrow(all_stats) > 0) {
+  write.csv(
+    all_stats,
+    "exports/veg_plot_statistics.csv",
+    row.names = FALSE
+  )
+} else {
+  warning("No plot statistics to export.")
+}
 ```
 
