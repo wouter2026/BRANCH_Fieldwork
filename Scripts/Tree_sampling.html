@@ -825,6 +825,7 @@ library(tidyr)</code></pre>
   n_totaal_ronde1 = 800,
   n_totaal_ronde2 = 200,
   n_min_genus = 5,
+  n_min_genus_pool = 5,
   use_strata = TRUE,
   strata_vars = c(&quot;LCZ_class&quot;, &quot;ESA_WC_class&quot;),
   strata_mode = c(&quot;proportional&quot;, &quot;equal&quot;)
@@ -867,6 +868,48 @@ library(tidyr)</code></pre>
     df %&gt;% slice_sample(n = n_draw)
   }
 
+  top_up_round1_by_city &lt;- function(trees_all, n_per_city, n_total_round1) {
+    df &lt;- as.data.frame(trees_all)
+    remaining_global &lt;- max(n_total_round1 - sum(df$sample_round == 1), 0)
+    if (remaining_global &lt;= 0) return(trees_all)
+
+    city_state &lt;- tibble(city = unique(df$city)) %&gt;%
+      left_join(df %&gt;% filter(sample_round == 1) %&gt;% count(city, name = &quot;n_current&quot;), by = &quot;city&quot;) %&gt;%
+      mutate(n_current = replace_na(n_current, 0L),
+             deficit = pmax(n_per_city - n_current, 0L)) %&gt;%
+      arrange(desc(deficit))
+
+    for (i in seq_len(nrow(city_state))) {
+      if (remaining_global &lt;= 0) break
+      city_i &lt;- city_state$city[i]
+      deficit_i &lt;- city_state$deficit[i]
+      if (deficit_i &lt;= 0) next
+
+      df &lt;- as.data.frame(trees_all)
+      pool_city &lt;- df %&gt;% filter(sample_round == 0, city == city_i)
+      if (nrow(pool_city) == 0) next
+
+      n_take &lt;- min(deficit_i, nrow(pool_city), remaining_global)
+      if (n_take &lt;= 0) next
+      ids_take &lt;- safe_slice_sample(pool_city, n_take)$ID
+      trees_all$sample_round[trees_all$ID %in% ids_take] &lt;- 1L
+      remaining_global &lt;- remaining_global - length(ids_take)
+    }
+
+    trees_all
+  }
+
+  df &lt;- as.data.frame(trees_all)
+
+  # Exclude rare genera from the sampling frame
+  genus_counts &lt;- df %&gt;% count(genus, name = &quot;n_genus&quot;)
+  eligible_genera &lt;- genus_counts %&gt;%
+    filter(n_genus &gt;= n_min_genus_pool) %&gt;%
+    pull(genus)
+  if (length(eligible_genera) == 0) {
+    stop(&quot;No genera meet n_min_genus_pool = &quot;, n_min_genus_pool)
+  }
+  trees_all &lt;- trees_all[trees_all$genus %in% eligible_genera, ]
   df &lt;- as.data.frame(trees_all)
 
   # ROUND 1: minimum per genus (city caps are guidelines; ensure all genera are represented)
@@ -919,6 +962,10 @@ library(tidyr)</code></pre>
       df &lt;- as.data.frame(trees_all)
     }
   }
+
+  # Round 1 top-up: if strata-first draw leaves city deficits, fill toward per-city guideline
+  trees_all &lt;- top_up_round1_by_city(trees_all, n_stad_ronde1, n_totaal_ronde1)
+  df &lt;- as.data.frame(trees_all)
 
   # ROUND 2: per-city extra caps
   df &lt;- as.data.frame(trees_all)
@@ -1040,6 +1087,7 @@ res &lt;- sample_trees(
   n_totaal_ronde1 = 800,
   n_totaal_ronde2 = 200,
   n_min_genus = 5,
+  n_min_genus_pool = 5,
   use_strata = TRUE,
   strata_vars = c(&quot;LCZ_class&quot;, &quot;ESA_WC_class&quot;),
   strata_mode = &quot;equal&quot; # equal or proportional
@@ -1052,53 +1100,53 @@ trees_all_sampled &lt;- res$trees
 table(as.data.frame(trees_all_sampled)$sample_round)</code></pre>
 <pre><code>## 
 ##      0      1      2 
-## 100371    653    136</code></pre>
+## 100156    800    133</code></pre>
 <pre class="r"><code>res$summary_by_city</code></pre>
 <pre><code>## # A tibble: 4 × 4
 ##   city     not_sampled round1 round2
 ##   &lt;chr&gt;          &lt;int&gt;  &lt;int&gt;  &lt;int&gt;
-## 1 Brussels       50847    223     50
-## 2 Hasselt         2174     27      1
-## 3 Leuven         19691    200     35
-## 4 Liege          27659    203     50</code></pre>
+## 1 Brussels       50837    200     50
+## 2 Hasselt         1998    200      1
+## 3 Leuven         19685    200     32
+## 4 Liege          27636    200     50</code></pre>
 <pre class="r"><code>res$summary_by_genus</code></pre>
-<pre><code>## # A tibble: 136 × 4
+<pre><code>## # A tibble: 95 × 4
 ##    genus    not_sampled round1 round2
 ##    &lt;chr&gt;          &lt;int&gt;  &lt;int&gt;  &lt;int&gt;
-##  1 Onbekend        3656     28      8
-##  2 Tilia          12639     16     16
-##  3 Acer           14228     15     13
-##  4 Platanus       11686     10     17
-##  5 Prunus          4564     19      6
-##  6 Fraxinus        4463      8     10
-##  7 Quercus         5269     10      8
-##  8 Aesculus        6196      6      7
-##  9 Carpinus        4817      9      4
-## 10 Fagus           2368      9      3
-## # ℹ 126 more rows</code></pre>
+##  1 Acer           14183     54     19
+##  2 Tilia          12614     39     18
+##  3 Fraxinus        4439     39      3
+##  4 Platanus       11676     28      9
+##  5 Onbekend        3661     25      6
+##  6 Carpinus        4804     18      8
+##  7 Prunus          4563     17      9
+##  8 &lt;NA&gt;             664     25      1
+##  9 Pyrus           2246     20      4
+## 10 Quercus         5263     13     11
+## # ℹ 85 more rows</code></pre>
 <pre class="r"><code>res$summary_by_strata</code></pre>
 <pre><code>## # A tibble: 6 × 4
 ##   strata not_sampled round1 round2
 ##   &lt;fct&gt;        &lt;int&gt;  &lt;int&gt;  &lt;int&gt;
-## 1 1.1           6776     67     18
-## 2 2.1          31795    197     27
-## 3 3.1           7055     39     26
-## 4 1.2          21383    134     19
-## 5 2.2          31227    189     25
-## 6 3.2           2135     27     21</code></pre>
+## 1 1.1           6767     68     21
+## 2 2.1          31704    263     26
+## 3 3.1           7052     44     21
+## 4 1.2          21395    111     16
+## 5 2.2          31101    294     23
+## 6 3.2           2137     20     26</code></pre>
 <pre class="r"><code>res$summary_by_lcz</code></pre>
 <pre><code>## # A tibble: 3 × 4
 ##   LCZ_class not_sampled round1 round2
 ##       &lt;int&gt;       &lt;int&gt;  &lt;int&gt;  &lt;int&gt;
-## 1         1       28159    201     37
-## 2         2       63022    386     52
-## 3         3        9190     66     47</code></pre>
+## 1         1       28162    179     37
+## 2         2       62805    557     49
+## 3         3        9189     64     47</code></pre>
 <pre class="r"><code>res$summary_by_wc</code></pre>
 <pre><code>## # A tibble: 2 × 4
 ##   ESA_WC_class not_sampled round1 round2
 ##   &lt;chr&gt;              &lt;int&gt;  &lt;int&gt;  &lt;int&gt;
-## 1 built_up           54745    350     65
-## 2 natural            45626    303     71</code></pre>
+## 1 built_up           54633    425     65
+## 2 natural            45523    375     68</code></pre>
 <ol start="7" style="list-style-type: decimal">
 <li>Export</li>
 </ol>

@@ -244,6 +244,7 @@ sample_trees <- function(
   n_totaal_ronde1 = 800,
   n_totaal_ronde2 = 200,
   n_min_genus = 5,
+  n_min_genus_pool = 5,
   use_strata = TRUE,
   strata_vars = c("LCZ_class", "ESA_WC_class"),
   strata_mode = c("proportional", "equal")
@@ -286,6 +287,48 @@ sample_trees <- function(
     df %>% slice_sample(n = n_draw)
   }
 
+  top_up_round1_by_city <- function(trees_all, n_per_city, n_total_round1) {
+    df <- as.data.frame(trees_all)
+    remaining_global <- max(n_total_round1 - sum(df$sample_round == 1), 0)
+    if (remaining_global <= 0) return(trees_all)
+
+    city_state <- tibble(city = unique(df$city)) %>%
+      left_join(df %>% filter(sample_round == 1) %>% count(city, name = "n_current"), by = "city") %>%
+      mutate(n_current = replace_na(n_current, 0L),
+             deficit = pmax(n_per_city - n_current, 0L)) %>%
+      arrange(desc(deficit))
+
+    for (i in seq_len(nrow(city_state))) {
+      if (remaining_global <= 0) break
+      city_i <- city_state$city[i]
+      deficit_i <- city_state$deficit[i]
+      if (deficit_i <= 0) next
+
+      df <- as.data.frame(trees_all)
+      pool_city <- df %>% filter(sample_round == 0, city == city_i)
+      if (nrow(pool_city) == 0) next
+
+      n_take <- min(deficit_i, nrow(pool_city), remaining_global)
+      if (n_take <= 0) next
+      ids_take <- safe_slice_sample(pool_city, n_take)$ID
+      trees_all$sample_round[trees_all$ID %in% ids_take] <- 1L
+      remaining_global <- remaining_global - length(ids_take)
+    }
+
+    trees_all
+  }
+
+  df <- as.data.frame(trees_all)
+
+  # Exclude rare genera from the sampling frame
+  genus_counts <- df %>% count(genus, name = "n_genus")
+  eligible_genera <- genus_counts %>%
+    filter(n_genus >= n_min_genus_pool) %>%
+    pull(genus)
+  if (length(eligible_genera) == 0) {
+    stop("No genera meet n_min_genus_pool = ", n_min_genus_pool)
+  }
+  trees_all <- trees_all[trees_all$genus %in% eligible_genera, ]
   df <- as.data.frame(trees_all)
 
   # ROUND 1: minimum per genus (city caps are guidelines; ensure all genera are represented)
@@ -338,6 +381,10 @@ sample_trees <- function(
       df <- as.data.frame(trees_all)
     }
   }
+
+  # Round 1 top-up: if strata-first draw leaves city deficits, fill toward per-city guideline
+  trees_all <- top_up_round1_by_city(trees_all, n_stad_ronde1, n_totaal_ronde1)
+  df <- as.data.frame(trees_all)
 
   # ROUND 2: per-city extra caps
   df <- as.data.frame(trees_all)
@@ -448,6 +495,7 @@ res <- sample_trees(
   n_totaal_ronde1 = 800,
   n_totaal_ronde2 = 200,
   n_min_genus = 5,
+  n_min_genus_pool = 5,
   use_strata = TRUE,
   strata_vars = c("LCZ_class", "ESA_WC_class"),
   strata_mode = "equal" # equal or proportional

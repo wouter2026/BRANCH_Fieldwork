@@ -11,7 +11,7 @@ suppressPackageStartupMessages({
 # 1) loads study area + LCZ/OSM rasters,
 # 2) samples candidate points per city,
 # 3) selects points stratified by OSM class,
-# 4) rebalances LCZ globally by swapping points within same city + OSM,
+# 4) rebalances LCZ within each city by swapping points within same OSM,
 # 5) exports points, 100x100 m squares, and statistics tables.
 
 utils::globalVariables(c(
@@ -50,7 +50,7 @@ selected_cities <- c("BRUSSEL", "LUIK", "LEUVEN", "HASSELT")
 
 n_plots_per_city <- 20
 plot_size <- 100
-min_distance <- 150
+min_distance <- 250
 n_candidates <- 10000
 
 # OSM stratification targets.
@@ -60,20 +60,21 @@ n_plots_per_osm_class <- 5L
 # Keep only these OSM classes (labels). Set to NULL to keep all non-NA OSM classes.
 allowed_osm_labels <- c("High green", "Low green", "Mixed", "Mid green")
 
-# Global LCZ rebalance settings (applied after OSM-balanced selection).
-min_global_lcz_per_class <- 20L
+# City-level LCZ rebalance settings (applied after OSM-balanced selection).
+min_city_lcz_per_class <- 6L
 max_lcz_rebalance_iter <- 200L
 
-seed <- 42
+seed <- 44
+seed_suffix <- paste0("_", as.character(seed))
 
 export_folder <- "exports"
-export_points <- file.path(export_folder, "veg_plot_points.gpkg")
-export_squares <- file.path(export_folder, "veg_plot_squares.gpkg")
-export_stats <- file.path(export_folder, "veg_plot_statistics.csv")
-export_diagnostics <- file.path(export_folder, "veg_plot_diagnostics.csv")
-export_validation_city <- file.path(export_folder, "validation_points_per_city.csv")
-export_validation_city_osm <- file.path(export_folder, "validation_points_per_city_osm.csv")
-export_validation_lcz <- file.path(export_folder, "validation_points_per_lcz.csv")
+export_points <- file.path(export_folder, paste0("veg_plot_points", seed_suffix, ".gpkg"))
+export_squares <- file.path(export_folder, paste0("veg_plot_squares", seed_suffix, ".gpkg"))
+export_stats <- file.path(export_folder, paste0("veg_plot_statistics", seed_suffix, ".csv"))
+export_diagnostics <- file.path(export_folder, paste0("veg_plot_diagnostics", seed_suffix, ".csv"))
+export_validation_city <- file.path(export_folder, paste0("validation_points_per_city", seed_suffix, ".csv"))
+export_validation_city_osm <- file.path(export_folder, paste0("validation_points_per_city_osm", seed_suffix, ".csv"))
+export_validation_lcz <- file.path(export_folder, paste0("validation_points_per_lcz", seed_suffix, ".csv"))
 
 message("Project root: ", project_root)
 
@@ -472,71 +473,85 @@ sample_city_plots <- function(city_poly, city_id, seed_city) {
   )
 }
 
-# Swap points to improve global LCZ balance while preserving city + OSM quotas.
-rebalance_lcz_global <- function(city_results, min_per_class, max_iter) {
-  for (iter in seq_len(max_iter)) {
-    selected_all <- bind_rows(lapply(city_results, function(res) res$selected_df))
-    if (nrow(selected_all) == 0) break
+# Swap points to improve LCZ balance within each city while preserving OSM quotas.
+rebalance_lcz_by_city <- function(city_results, min_per_class, max_iter) {
+  for (city_id in names(city_results)) {
+    selected_df <- city_results[[city_id]]$selected_df
+    candidates <- city_results[[city_id]]$candidates
+    if (is.null(selected_df) || is.null(candidates) || nrow(selected_df) == 0) next
 
-    lcz_counts <- sort(table(selected_all$LCZ))
-    if (length(lcz_counts) == 0 || all(as.integer(lcz_counts) >= min_per_class)) break
+    city_lcz_classes <- sort(unique(as.character(candidates$LCZ)))
+    city_lcz_classes <- city_lcz_classes[!is.na(city_lcz_classes) & nzchar(city_lcz_classes)]
+    if (length(city_lcz_classes) == 0) next
 
-    need_class <- names(which.min(lcz_counts))
-    donor_class <- names(which.max(lcz_counts))
-    if (as.integer(lcz_counts[[donor_class]]) <= min_per_class) break
+    for (iter in seq_len(max_iter)) {
+      lcz_counts <- table(factor(as.character(selected_df$LCZ), levels = city_lcz_classes))
+      lcz_counts <- as.integer(lcz_counts)
+      names(lcz_counts) <- city_lcz_classes
 
-    swapped <- FALSE
-    for (city_id in names(city_results)) {
-      selected_df <- city_results[[city_id]]$selected_df
-      candidates <- city_results[[city_id]]$candidates
-      if (is.null(selected_df) || is.null(candidates) || nrow(selected_df) == 0) next
+      if (all(lcz_counts >= min_per_class)) break
 
-      donor_rows <- selected_df |>
-        filter(.data$LCZ == donor_class)
-      if (nrow(donor_rows) == 0) next
+      need_classes <- names(lcz_counts)[lcz_counts < min_per_class]
+      donor_classes <- names(lcz_counts)[lcz_counts > min_per_class]
+      if (length(need_classes) == 0 || length(donor_classes) == 0) break
 
-      for (j in seq_len(nrow(donor_rows))) {
-        donor_row <- donor_rows[j, ]
-        other_selected <- selected_df |>
-          filter(.data$id != donor_row$id)
+      # Try underrepresented classes first, starting with the most underrepresented.
+      need_order <- need_classes[order(lcz_counts[need_classes], decreasing = FALSE)]
+      donor_order <- donor_classes[order(lcz_counts[donor_classes], decreasing = TRUE)]
 
-        replacement_pool <- candidates |>
-          filter(
-            .data$OSM == donor_row$OSM,
-            .data$LCZ == need_class,
-            !(.data$id %in% selected_df$id),
-            !((paste(.data$x, .data$y)) %in% (paste(other_selected$x, other_selected$y)))
-          )
+      swapped <- FALSE
+      for (need_class in need_order) {
+        if (swapped) break
+        for (donor_class in donor_order) {
+          donor_rows <- selected_df |>
+            filter(.data$LCZ == donor_class)
+          if (nrow(donor_rows) == 0) next
 
-        if (nrow(replacement_pool) > 0 && nrow(other_selected) > 0) {
-          keep_dist <- vapply(seq_len(nrow(replacement_pool)), function(k) {
-            d <- sqrt((other_selected$x - replacement_pool$x[k])^2 + (other_selected$y - replacement_pool$y[k])^2)
-            all(d >= min_distance)
-          }, logical(1))
-          replacement_pool <- replacement_pool[keep_dist, , drop = FALSE]
+          for (j in seq_len(nrow(donor_rows))) {
+            donor_row <- donor_rows[j, ]
+            other_selected <- selected_df |>
+              filter(.data$id != donor_row$id)
+
+            replacement_pool <- candidates |>
+              filter(
+                .data$OSM == donor_row$OSM,
+                .data$LCZ == need_class,
+                !(.data$id %in% selected_df$id),
+                !((paste(.data$x, .data$y)) %in% (paste(other_selected$x, other_selected$y)))
+              )
+
+            if (nrow(replacement_pool) > 0 && nrow(other_selected) > 0) {
+              keep_dist <- vapply(seq_len(nrow(replacement_pool)), function(k) {
+                d <- sqrt((other_selected$x - replacement_pool$x[k])^2 + (other_selected$y - replacement_pool$y[k])^2)
+                all(d >= min_distance)
+              }, logical(1))
+              replacement_pool <- replacement_pool[keep_dist, , drop = FALSE]
+            }
+
+            if (nrow(replacement_pool) == 0) next
+
+            replacement_row <- replacement_pool[1, ]
+            selected_df <- selected_df |>
+              filter(.data$id != donor_row$id)
+            selected_df <- bind_rows(selected_df, replacement_row)
+            selected_df <- sanitize_selected_spacing(
+              selected_df = selected_df,
+              candidates = candidates,
+              target_n = n_plots_per_city,
+              min_dist = min_distance
+            )
+            swapped <- TRUE
+            break
+          }
+
+          if (swapped) break
         }
-
-        if (nrow(replacement_pool) == 0) next
-
-        replacement_row <- replacement_pool[1, ]
-        selected_df <- selected_df |>
-          filter(.data$id != donor_row$id)
-        selected_df <- bind_rows(selected_df, replacement_row)
-        selected_df <- sanitize_selected_spacing(
-          selected_df = selected_df,
-          candidates = candidates,
-          target_n = n_plots_per_city,
-          min_dist = min_distance
-        )
-        city_results[[city_id]]$selected_df <- selected_df
-        swapped <- TRUE
-        break
       }
 
-      if (swapped) break
+      if (!swapped) break
     }
 
-    if (!swapped) break
+    city_results[[city_id]]$selected_df <- selected_df
   }
 
   city_results
@@ -605,9 +620,9 @@ for (i in seq_len(nrow(Study_area_sub))) {
   message("City ", city_id, ": selected ", nrow(res$stats), " plots")
 }
 
-city_results <- rebalance_lcz_global(
+city_results <- rebalance_lcz_by_city(
   city_results,
-  min_per_class = min_global_lcz_per_class,
+  min_per_class = min_city_lcz_per_class,
   max_iter = max_lcz_rebalance_iter
 )
 
